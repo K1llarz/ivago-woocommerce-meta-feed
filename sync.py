@@ -1,9 +1,10 @@
-
-import os
 import csv
-import requests
+import os
+import re
 from html import unescape
-from urllib.parse import urlparse
+
+import requests
+
 
 STORE_URL = os.environ["WC_STORE_URL"].rstrip("/")
 CONSUMER_KEY = os.environ["WC_CONSUMER_KEY"]
@@ -37,33 +38,71 @@ def fetch_all(endpoint, params=None):
 
         if len(batch) < 100:
             break
+
         page += 1
 
     return items
 
 
 def clean(value):
-    import re
     return re.sub(r"<[^>]+>", " ", unescape(str(value or ""))).strip()
 
 
 def availability(product):
-    if product.get("stock_status") == "instock":
+    stock_status = product.get("stock_status")
+
+    if stock_status == "instock":
         return "in stock"
-    if product.get("stock_status") == "onbackorder":
+    if stock_status == "onbackorder":
         return "available for order"
     return "out of stock"
 
 
-def make_row(product, parent=None):
+def category_depth(category, categories_by_id):
+    depth = 0
+    visited = {category["id"]}
+    parent_id = category.get("parent")
+
+    while parent_id and parent_id not in visited:
+        parent = categories_by_id.get(parent_id)
+        if parent is None:
+            break
+
+        visited.add(parent_id)
+        depth += 1
+        parent_id = parent.get("parent")
+
+    return depth
+
+
+def get_category_label(product, categories_by_id):
+    categories = [
+        categories_by_id.get(category["id"], category)
+        for category in product.get("categories") or []
+        if category.get("slug")
+    ]
+
+    if not categories:
+        return ""
+
+    category = min(
+        categories,
+        key=lambda item: (
+            -category_depth(item, categories_by_id),
+            item["id"],
+        ),
+    )
+
+    return category["slug"]
+
+
+def make_row(product, category_label, parent=None):
     source = parent or product
     image = (product.get("images") or source.get("images") or [{}])[0]
 
     price = product.get("price")
     if not price:
         return None
-
-    currency = "GEL"
 
     row = {
         "id": str(product["id"]),
@@ -73,10 +112,11 @@ def make_row(product, parent=None):
         )[:5000],
         "availability": availability(product),
         "condition": "new",
-        "price": f"{price} {currency}",
+        "price": f"{price} GEL",
         "link": product.get("permalink") or source.get("permalink"),
         "image_link": image.get("src", ""),
         "brand": "Ivago",
+        "custom_label_0": category_label,
     }
 
     if parent:
@@ -86,21 +126,25 @@ def make_row(product, parent=None):
 
 
 def main():
+    categories = fetch_all("products/categories")
+    categories_by_id = {category["id"]: category for category in categories}
+
     products = fetch_all("products", {"status": "publish"})
     rows = []
 
     for product in products:
+        category_label = get_category_label(product, categories_by_id)
+
         if product.get("type") == "variable":
-            variations = fetch_all(
-                f"products/{product['id']}/variations"
-            )
+            variations = fetch_all(f"products/{product['id']}/variations")
+
             for variation in variations:
                 if variation.get("status") == "publish":
-                    row = make_row(variation, product)
+                    row = make_row(variation, category_label, parent=product)
                     if row:
                         rows.append(row)
         else:
-            row = make_row(product)
+            row = make_row(product, category_label)
             if row:
                 rows.append(row)
 
@@ -108,13 +152,21 @@ def main():
         raise RuntimeError("No valid products returned; keeping old feed")
 
     fields = [
-        "id", "title", "description", "availability",
-        "condition", "price", "link", "image_link",
-        "brand", "item_group_id",
+        "id",
+        "title",
+        "description",
+        "availability",
+        "condition",
+        "price",
+        "link",
+        "image_link",
+        "brand",
+        "item_group_id",
+        "custom_label_0",
     ]
 
-    with open("products.csv.tmp", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+    with open("products.csv.tmp", "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
